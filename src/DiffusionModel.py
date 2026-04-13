@@ -12,7 +12,7 @@ def get_eurosat_loader(data_dir, batch_size=32):
         transforms.ToTensor(),
     ])
     full_dataset = datasets.ImageFolder(root=data_dir, transform=transform)
-    highway_idx = full_dataset.class_to_idx['Highway']
+    highway_idx = full_dataset.class_to_idx['AnnualCrop']
     indices = [i for i, (_, label) in enumerate(full_dataset.samples) if label == highway_idx]
     highway_subset = torch.utils.data.Subset(full_dataset, indices)
     return DataLoader(highway_subset, batch_size=batch_size, shuffle=True)
@@ -36,6 +36,20 @@ def forward_diffusion(x_0, t):
     epsilon = torch.randn_like(x_0)
     return mean_coef * x_0 + std * epsilon, epsilon
 
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels)
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
 class ScoreNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -44,22 +58,25 @@ class ScoreNet(nn.Module):
             nn.SiLU(),
             nn.Linear(128, 128)
         )
+        self.inc = nn.Conv2d(3, 128, 3, padding=1)
         self.down = nn.Sequential(
-            nn.Conv2d(3, 64, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1)
+            ResBlock(128),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1)
         )
+        self.mid = ResBlock(256)
         self.up = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(64, 3, 3, padding=1)
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            ResBlock(128)
         )
+        self.out = nn.Conv2d(128, 3, 3, padding=1)
 
     def forward(self, x, t):
         t_emb = self.time_embed(t.view(-1, 1)).view(-1, 128, 1, 1)
-        h = self.down(x)
-        h = h + t_emb
-        return self.up(h)
+        x = self.inc(x)
+        h = self.down(x + t_emb)
+        h = self.mid(h)
+        h = self.up(h)
+        return self.out(h)
 
 def denoising_score_loss(score_net, x_0, t):
     x_t, z = forward_diffusion(x_0, t)
@@ -81,11 +98,13 @@ def sample_ula(score_net, shape, steps, h):
             x = x + h * score + torch.sqrt(torch.tensor(2 * h)) * xi
     return x
 
-def run_training(score_net, dataloader, mean, std, epochs=100, lr=1e-4):
+def run_training(score_net, dataloader, mean, std, epochs=100, lr=5e-5):
     optimizer = Adam(score_net.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     device = next(score_net.parameters()).device
     score_net.train()
     history = []
+    
     for epoch in range(epochs):
         epoch_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
@@ -93,17 +112,23 @@ def run_training(score_net, dataloader, mean, std, epochs=100, lr=1e-4):
             x_raw = batch[0].to(device)
             x_0 = normalize_eurosat(x_raw, mean, std)
             t = torch.rand((x_0.shape[0],), device=device)
+            
             optimizer.zero_grad()
             loss = denoising_score_loss(score_net, x_0, t)
             loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(score_net.parameters(), 1.0)
+            
             optimizer.step()
             epoch_loss += loss.item()
-            pbar.set_postfix({"loss": loss.item()})
+            pbar.set_postfix({"loss": loss.item(), "lr": optimizer.param_groups[0]['lr']})
+            
+        scheduler.step()
         history.append(epoch_loss / len(dataloader))
     return history
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     data_path = "./Data"
     
     temp_loader = get_eurosat_loader(data_path, batch_size=32)
@@ -126,9 +151,11 @@ if __name__ == "__main__":
         dataloader=temp_loader,
         mean=mean,
         std=std,
-        epochs=10,
+        epochs=100,
         lr=1e-4
     )
+
+    torch.save(model.state_dict(), "score_net_eurosat.pth")
 
     plt.figure(figsize=(10, 5))
     plt.plot(losses)
