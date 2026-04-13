@@ -1,9 +1,10 @@
 import torch
 from torch import nn
 from torch.optim import Adam
-from torchvision import transforms, datasets
+from torchvision import transforms, datasets, utils
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 def get_eurosat_loader(data_dir, batch_size=32):
     transform = transforms.Compose([
@@ -25,7 +26,7 @@ def denormalize_eurosat(x, mean, std):
     mean = torch.tensor(mean).view(1, 3, 1, 1).to(x.device)
     std = torch.tensor(std).view(1, 3, 1, 1).to(x.device)
     x = x * std + mean
-    return torch.clamp(x * 255.0, 0, 255).byte()
+    return torch.clamp(x, 0, 1)
 
 def forward_diffusion(x_0, t):
     t = t.view(-1, 1, 1, 1)
@@ -70,19 +71,23 @@ def denoising_score_loss(score_net, x_0, t):
 def sample_ula(score_net, shape, steps, h):
     device = next(score_net.parameters()).device
     x = torch.randn(shape, device=device)
-    for k in range(steps, 0, -1):
-        t_val = k / steps
-        t = torch.full((shape[0],), t_val, device=device)
-        xi = torch.randn_like(x)
-        score = score_net(x, t)
-        x = x + h * score + torch.sqrt(torch.tensor(2 * h)) * xi
+    score_net.eval()
+    with torch.no_grad():
+        for k in range(steps, 0, -1):
+            t_val = k / steps
+            t = torch.full((shape[0],), t_val, device=device)
+            xi = torch.randn_like(x)
+            score = score_net(x, t)
+            x = x + h * score + torch.sqrt(torch.tensor(2 * h)) * xi
     return x
 
 def run_training(score_net, dataloader, mean, std, epochs=100, lr=1e-4):
     optimizer = Adam(score_net.parameters(), lr=lr)
     device = next(score_net.parameters()).device
     score_net.train()
+    history = []
     for epoch in range(epochs):
+        epoch_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         for batch in pbar:
             x_raw = batch[0].to(device)
@@ -92,10 +97,13 @@ def run_training(score_net, dataloader, mean, std, epochs=100, lr=1e-4):
             loss = denoising_score_loss(score_net, x_0, t)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
             pbar.set_postfix({"loss": loss.item()})
-    
+        history.append(epoch_loss / len(dataloader))
+    return history
+
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data_path = "./Data"
     
     temp_loader = get_eurosat_loader(data_path, batch_size=32)
@@ -113,14 +121,28 @@ if __name__ == "__main__":
     
     model = ScoreNet().to(device)
     
-    run_training(
+    losses = run_training(
         score_net=model,
         dataloader=temp_loader,
         mean=mean,
         std=std,
-        epochs=100,
+        epochs=10,
         lr=1e-4
     )
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses)
+    plt.title("Training Loss History")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.show()
     
     raw_samples = sample_ula(model, (16, 3, 64, 64), steps=1000, h=0.01)
     samples = denormalize_eurosat(raw_samples, mean, std)
+    
+    grid = utils.make_grid(samples, nrow=4)
+    plt.figure(figsize=(8, 8))
+    plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
+    plt.title("Generated Highway Samples")
+    plt.axis("off")
+    plt.show()
