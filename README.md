@@ -18,7 +18,7 @@ $$
 
 ## Score Matching Objective
 
-The network $ s_\theta(x_t, t)$ is trained via denoising score matching:
+The network $s_\theta(x_t, t)$ is trained via denoising score matching:
 
 $$
 \mathcal{L} = \mathbb{E}*{t, x_0, \epsilon} \left[
@@ -46,13 +46,13 @@ $$
 x_{k-1} = x_k + h , s_\theta(x_k, t_k) + \sqrt{2h} , \xi_k
 $$
 
-with $ \xi_k \sim \mathcal{N}(0, I) $
+with $\xi_k \sim \mathcal{N}(0, I)$
 
 ## Training
 
 * Optimizer: Adam
 * LR schedule: Cosine annealing
-* Gradient clipping: ( |\nabla| \leq 1 )
+* Gradient clipping: $|\nabla| \leq 1$
 
 ## Output
 
