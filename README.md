@@ -18,19 +18,19 @@ $$
 
 ## Score Matching Objective
 
-The network ( s_\theta(x_t, t) ) is trained via denoising score matching:
+The network $ s_\theta(x_t, t)$ is trained via denoising score matching:
 
-[
+$$
 \mathcal{L} = \mathbb{E}*{t, x_0, \epsilon} \left[
 \left| \sigma_t s*\theta(x_t, t) + \epsilon \right|^2
 \right]
-]
+$$
 
 with
 
-[
+$$
 \sigma_t = \sqrt{1 - e^{-2t}}
-]
+$$
 
 ## Model
 
@@ -42,11 +42,11 @@ with
 
 Unadjusted Langevin Algorithm:
 
-[
+$$
 x_{k-1} = x_k + h , s_\theta(x_k, t_k) + \sqrt{2h} , \xi_k
-]
+$$
 
-with ( \xi_k \sim \mathcal{N}(0, I) )
+with $ \xi_k \sim \mathcal{N}(0, I) $
 
 ## Training
 
