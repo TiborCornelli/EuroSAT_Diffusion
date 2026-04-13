@@ -135,7 +135,7 @@ if __name__ == "__main__":
     plt.title("Training Loss History")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.show()
+    plt.savefig('loss_history.png')
     
     raw_samples = sample_ula(model, (16, 3, 64, 64), steps=1000, h=0.01)
     samples = denormalize_eurosat(raw_samples, mean, std)
@@ -145,4 +145,4 @@ if __name__ == "__main__":
     plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
     plt.title("Generated Highway Samples")
     plt.axis("off")
-    plt.show()
+    plt.savefig('examples.png')
