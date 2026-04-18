@@ -8,11 +8,13 @@ import h5py
 import numpy as np
 import math
 
+
 class EMA:
     def __init__(self, model: nn.Module, decay=0.999):
         self.model = model
         self.decay = decay
         self.shadow = {name: param.data.clone() for name, param in model.named_parameters()}
+        self.backup = {}
 
     def update(self):
         for name, param in self.model.named_parameters():
@@ -23,7 +25,14 @@ class EMA:
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
+                self.backup[name] = param.data.clone()
                 param.data.copy_(self.shadow[name])
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+
 
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -39,6 +48,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
+
 class AttentionBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -53,6 +63,7 @@ class AttentionBlock(nn.Module):
         attn = attn.softmax(dim=-1)
         h_ = (v @ attn.transpose(-1, -2)).reshape(b, c, h, w)
         return x + self.proj(h_)
+
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, emb_dim=256):
@@ -71,6 +82,7 @@ class ResBlock(nn.Module):
         h = self.norm2(self.conv2(h))
         return self.silu(h + self.shortcut(x))
 
+
 class ScoreNet(nn.Module):
     def __init__(self, channels=64):
         super().__init__()
@@ -83,19 +95,15 @@ class ScoreNet(nn.Module):
         self.inc = nn.Conv2d(3, channels, 3, padding=1)
         
         self.down1 = ResBlock(channels, channels * 2)
-        self.down2 = nn.Sequential(
-            nn.Conv2d(channels * 2, channels * 2, 3, stride=2, padding=1),
-            ResBlock(channels * 2, channels * 4)
-        )
+        self.down_conv = nn.Conv2d(channels * 2, channels * 2, 3, stride=2, padding=1)
+        self.down2_block = ResBlock(channels * 2, channels * 4)
         
         self.mid1 = ResBlock(channels * 4, channels * 4)
         self.attn = AttentionBlock(channels * 4)
         self.mid2 = ResBlock(channels * 4, channels * 4)
         
-        self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            ResBlock(channels * 4 + channels * 2, channels * 2)
-        )
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up1_block = ResBlock(channels * 4 + channels * 2, channels * 2)
         self.up2 = ResBlock(channels * 2 + channels, channels)
         
         self.out = nn.Conv2d(channels, 3, 1)
@@ -106,17 +114,16 @@ class ScoreNet(nn.Module):
         x1 = self.inc(x)
         x2 = self.down1(x1, t_emb)
         
-        # Manually apply t_emb to blocks within Sequential wrappers
-        x3_in = nn.Conv2d(128, 128, 3, stride=2, padding=1).to(x.device)(x2) 
-        x3 = self.down2[1](x3_in, t_emb)
+        x3 = self.down_conv(x2)
+        x3 = self.down2_block(x3, t_emb)
         
         x4 = self.mid1(x3, t_emb)
         x4 = self.attn(x4)
         x4 = self.mid2(x4, t_emb)
         
-        x5 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)(x4)
+        x5 = self.upsample(x4)
         x5 = torch.cat([x5, x2], dim=1)
-        x5 = self.up1[1](x5, t_emb)
+        x5 = self.up1_block(x5, t_emb)
         
         x6 = torch.cat([x5, x1], dim=1)
         x6 = self.up2(x6, t_emb)
@@ -176,12 +183,18 @@ class Galaxy10Dataset(Dataset):
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    
     dataset = Galaxy10Dataset("/kaggle/input/datasets/tiborcornelli/galaxy10/Galaxy10.h5")
     indices = [i for i, label in enumerate(dataset.labels) if label == 1]
-    loader = DataLoader(Subset(dataset, indices), batch_size=32, shuffle=True)
+    loader = DataLoader(Subset(dataset, indices), batch_size=64, shuffle=True)
     
     model = ScoreNet().to(device)
-    ema = EMA(model)
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+    
+    ema = EMA(model.module if isinstance(model, nn.DataParallel) else model)
     optimizer = Adam(model.parameters(), lr=1e-4)
     diffusion = Diffusion(device=device)
     
@@ -193,6 +206,7 @@ def train():
             images = images.to(device)
             t = torch.randint(low=0, high=1000, size=(images.shape[0],)).to(device)
             x_t, noise = diffusion.noise_image(images, t)
+            
             predicted_noise = model(x_t, t)
             loss = nn.functional.mse_loss(noise, predicted_noise)
             
@@ -204,19 +218,15 @@ def train():
 
         if (epoch + 1) % 10 == 0:
             ema.apply_shadow()
-            samples = diffusion.sample(model, 16)
+            sampling_model = model.module if isinstance(model, nn.DataParallel) else model
+            samples = diffusion.sample(sampling_model, 16)
             samples = (samples.clamp(-1, 1) + 1) / 2
             utils.save_image(samples, f"samples_epoch_{epoch+1}.png", nrow=4)
             ema.restore()
 
     ema.apply_shadow()
-    torch.save(model.state_dict(), "galaxy_diffusion_model.pth")
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }
-    torch.save(checkpoint, "checkpoint.pth")
+    final_model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save(final_model_state, "galaxy_diffusion_model.pth")
 
 if __name__ == "__main__":
     train()
