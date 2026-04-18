@@ -187,7 +187,7 @@ def train():
     
     for epoch in range(50):
         pbar = tqdm(loader)
-        pbar.set_postfix(epoch=epoch, MSE=loss.item())
+        pbar.set_description(f"Epoch {epoch}")
         for i, (images, _) in enumerate(pbar):
             images = images.to(device)
             t = torch.randint(low=0, high=1000, size=(images.shape[0],)).to(device)
