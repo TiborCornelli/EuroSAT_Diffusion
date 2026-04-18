@@ -37,53 +37,93 @@ def forward_diffusion(x_0, t):
     return mean_coef * x_0 + std * epsilon, epsilon
 
 class ResBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, emb_dim=256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels),
+        self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels)
+            nn.Linear(emb_dim, channels)
         )
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, channels)
+        self.silu = nn.SiLU()
 
-    def forward(self, x):
-        return x + self.net(x)
+    def forward(self, x, t_emb):
+        h = self.conv1(x)
+        h = self.norm1(h)
+        # Inject time embedding
+        h = h + self.mlp(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = self.silu(h)
+        h = self.conv2(h)
+        h = self.norm2(h)
+        return x + h
+
+class DownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, emb_dim=256):
+        super().__init__()
+        self.res = ResBlock(in_channels, emb_dim)
+        self.down = nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1)
+
+    def forward(self, x, t_emb):
+        x = self.res(x, t_emb)
+        x = self.down(x)
+        return x
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, emb_dim=256):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1)
+        self.res = ResBlock(out_channels, emb_dim)
+
+    def forward(self, x, t_emb):
+        x = self.up(x)
+        x = self.res(x, t_emb)
+        return x
 
 class ScoreNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.time_embed = nn.Sequential(
-            nn.Linear(1, 128),
+            nn.Linear(1, 256),
             nn.SiLU(),
-            nn.Linear(128, 128)
+            nn.Linear(256, 256)
         )
-        self.inc = nn.Conv2d(3, 128, 3, padding=1)
-        self.down = nn.Sequential(
-            ResBlock(128),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1)
-        )
-        self.mid = ResBlock(256)
-        self.up = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
-            ResBlock(128)
-        )
-        self.out = nn.Conv2d(128, 3, 3, padding=1)
+        
+        self.inc = nn.Conv2d(3, 64, 3, padding=1)
+        
+        self.down1 = DownBlock(64, 128)
+        self.down2 = DownBlock(128, 256)
+        self.down3 = DownBlock(256, 512)
+        
+        self.mid = ResBlock(512)
+        
+        self.up1 = UpBlock(512, 256)
+        self.up2 = UpBlock(256, 128)
+        self.up3 = UpBlock(128, 64)
+        
+        self.out = nn.Conv2d(64, 3, 3, padding=1)
 
     def forward(self, x, t):
-        t_emb = self.time_embed(t.view(-1, 1)).view(-1, 128, 1, 1)
-        x = self.inc(x)
-        h = self.down(x + t_emb)
-        h = self.mid(h)
-        h = self.up(h)
+        t_emb = self.time_embed(t.view(-1, 1))
+        
+        h = self.inc(x)
+        h = self.down1(h, t_emb)
+        h = self.down2(h, t_emb)
+        h = self.down3(h, t_emb)
+        
+        h = self.mid(h, t_emb)
+        
+        h = self.up1(h, t_emb)
+        h = self.up2(h, t_emb)
+        h = self.up3(h, t_emb)
+        
         return self.out(h)
 
 def denoising_score_loss(score_net, x_0, t):
-    x_t, z = forward_diffusion(x_0, t)
-    sigma_t = torch.sqrt(1 - torch.exp(-2 * t)).view(-1, 1, 1, 1)
-    predicted_score = score_net(x_t, t)
-    loss = torch.mean((sigma_t * predicted_score + z / sigma_t * sigma_t)**2)
-    return loss
+    x_t, epsilon = forward_diffusion(x_0, t)
+    predicted_noise = score_net(x_t, t)
+    return nn.functional.mse_loss(predicted_noise, epsilon)
 
 def sample_ula(score_net, shape, steps, h):
     device = next(score_net.parameters()).device
