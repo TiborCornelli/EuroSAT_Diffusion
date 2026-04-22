@@ -2,214 +2,198 @@ import torch
 from torch import nn
 from torch.optim import Adam
 from torchvision import transforms, datasets, utils
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-import matplotlib.pyplot as plt
+import math
 
-def get_eurosat_loader(data_dir, batch_size=32):
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {name: param.data.clone() for name, param in model.named_parameters()}
+        self.backup = {}
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name].copy_(new_average)
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+class AttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        q, k, v = self.qkv(self.norm(x)).reshape(b, 3, c, h * w).unbind(1)
+        attn = (q.transpose(-1, -2) @ k) * (c ** -0.5)
+        attn = attn.softmax(dim=-1)
+        h_ = (v @ attn.transpose(-1, -2)).reshape(b, c, h, w)
+        return x + self.proj(h_)
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, emb_dim=256):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, out_channels))
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, out_channels)
+        self.silu = nn.SiLU()
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x, t_emb):
+        h = self.silu(self.norm1(self.conv1(x)))
+        h = h + self.mlp(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = self.norm2(self.conv2(h))
+        return self.silu(h + self.shortcut(x))
+
+class ScoreNet(nn.Module):
+    def __init__(self, channels=64):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(256),
+            nn.Linear(256, 256),
+            nn.SiLU()
+        )
+        self.inc = nn.Conv2d(3, channels, 3, padding=1)
+        self.down1 = ResBlock(channels, channels * 2)
+        self.down_conv = nn.Conv2d(channels * 2, channels * 2, 3, stride=2, padding=1)
+        self.down2_block = ResBlock(channels * 2, channels * 4)
+        self.mid1 = ResBlock(channels * 4, channels * 4)
+        self.attn = AttentionBlock(channels * 4)
+        self.mid2 = ResBlock(channels * 4, channels * 4)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up1_block = ResBlock(channels * 4 + channels * 2, channels * 2)
+        self.up2 = ResBlock(channels * 2 + channels, channels)
+        self.out = nn.Conv2d(channels, 3, 1)
+
+    def forward(self, x, t):
+        t_emb = self.time_mlp(t)
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t_emb)
+        x3 = self.down_conv(x2)
+        x3 = self.down2_block(x3, t_emb)
+        x4 = self.mid1(x3, t_emb)
+        x4 = self.attn(x4)
+        x4 = self.mid2(x4, t_emb)
+        x5 = self.upsample(x4)
+        x5 = torch.cat([x5, x2], dim=1)
+        x5 = self.up1_block(x5, t_emb)
+        x6 = torch.cat([x5, x1], dim=1)
+        x6 = self.up2(x6, t_emb)
+        return self.out(x6)
+
+class Diffusion:
+    def __init__(self, steps=1000, beta_start=1e-4, beta_end=0.02, device="cuda"):
+        self.steps = steps
+        self.beta = torch.linspace(beta_start, beta_end, steps).to(device)
+        self.alpha = 1.0 - self.beta
+        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+
+    def noise_image(self, x, t):
+        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
+        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
+        epsilon = torch.randn_like(x)
+        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * epsilon, epsilon
+
+    def sample(self, model, n):
+        model.eval()
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            x = torch.randn((n, 3, 64, 64)).to(device)
+            for i in tqdm(reversed(range(0, self.steps)), position=0, leave=False):
+                t = (torch.ones(n) * i).long().to(device)
+                predicted_noise = model(x, t)
+                alpha = self.alpha[t][:, None, None, None]
+                alpha_hat = self.alpha_hat[t][:, None, None, None]
+                beta = self.beta[t][:, None, None, None]
+                noise = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
+                x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
+        return x
+
+def get_eurosat_loader(data_dir, batch_size=64):
     transform = transforms.Compose([
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     full_dataset = datasets.ImageFolder(root=data_dir, transform=transform)
-    highway_idx = full_dataset.class_to_idx['AnnualCrop']
+    highway_idx = full_dataset.class_to_idx['Highway']
     indices = [i for i, (_, label) in enumerate(full_dataset.samples) if label == highway_idx]
-    highway_subset = torch.utils.data.Subset(full_dataset, indices)
-    return DataLoader(highway_subset, batch_size=batch_size, shuffle=True)
+    return DataLoader(Subset(full_dataset, indices), batch_size=batch_size, shuffle=True)
 
-def normalize_eurosat(x, mean, std):
-    mean = torch.tensor(mean).view(1, 3, 1, 1).to(x.device)
-    std = torch.tensor(std).view(1, 3, 1, 1).to(x.device)
-    return (x - mean) / std
-
-def denormalize_eurosat(x, mean, std):
-    mean = torch.tensor(mean).view(1, 3, 1, 1).to(x.device)
-    std = torch.tensor(std).view(1, 3, 1, 1).to(x.device)
-    x = x * std + mean
-    return torch.clamp(x, 0, 1)
-
-def forward_diffusion(x_0, t):
-    t = t.view(-1, 1, 1, 1)
-    mean_coef = torch.exp(-t)
-    var_coef = 1 - torch.exp(-2 * t)
-    std = torch.sqrt(var_coef)
-    epsilon = torch.randn_like(x_0)
-    return mean_coef * x_0 + std * epsilon, epsilon
-
-class ResBlock(nn.Module):
-    def __init__(self, channels, emb_dim=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(emb_dim, channels)
-        )
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm1 = nn.GroupNorm(8, channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, channels)
-        self.silu = nn.SiLU()
-
-    def forward(self, x, t_emb):
-        h = self.conv1(x)
-        h = self.norm1(h)
-        # Inject time embedding
-        h = h + self.mlp(t_emb).unsqueeze(-1).unsqueeze(-1)
-        h = self.silu(h)
-        h = self.conv2(h)
-        h = self.norm2(h)
-        return x + h
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, emb_dim=256):
-        super().__init__()
-        self.res = ResBlock(in_channels, emb_dim)
-        self.down = nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1)
-
-    def forward(self, x, t_emb):
-        x = self.res(x, t_emb)
-        x = self.down(x)
-        return x
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, emb_dim=256):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1)
-        self.res = ResBlock(out_channels, emb_dim)
-
-    def forward(self, x, t_emb):
-        x = self.up(x)
-        x = self.res(x, t_emb)
-        return x
-
-class ScoreNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, 256),
-            nn.SiLU(),
-            nn.Linear(256, 256)
-        )
-        
-        self.inc = nn.Conv2d(3, 64, 3, padding=1)
-        
-        self.down1 = DownBlock(64, 128)
-        self.down2 = DownBlock(128, 256)
-        self.down3 = DownBlock(256, 512)
-        
-        self.mid = ResBlock(512)
-        
-        self.up1 = UpBlock(512, 256)
-        self.up2 = UpBlock(256, 128)
-        self.up3 = UpBlock(128, 64)
-        
-        self.out = nn.Conv2d(64, 3, 3, padding=1)
-
-    def forward(self, x, t):
-        t_emb = self.time_embed(t.view(-1, 1))
-        
-        h = self.inc(x)
-        h = self.down1(h, t_emb)
-        h = self.down2(h, t_emb)
-        h = self.down3(h, t_emb)
-        
-        h = self.mid(h, t_emb)
-        
-        h = self.up1(h, t_emb)
-        h = self.up2(h, t_emb)
-        h = self.up3(h, t_emb)
-        
-        return self.out(h)
-
-def denoising_score_loss(score_net, x_0, t):
-    x_t, epsilon = forward_diffusion(x_0, t)
-    predicted_noise = score_net(x_t, t)
-    return nn.functional.mse_loss(predicted_noise, epsilon)
-
-def sample_ula(score_net, shape, steps, h):
-    device = next(score_net.parameters()).device
-    x = torch.randn(shape, device=device)
-    score_net.eval()
-    with torch.no_grad():
-        for k in range(steps, 0, -1):
-            t_val = k / steps
-            t = torch.full((shape[0],), t_val, device=device)
-            xi = torch.randn_like(x)
-            score = score_net(x, t)
-            x = x + h * score + torch.sqrt(torch.tensor(2 * h)) * xi
-    return x
-
-def run_training(score_net, dataloader, mean, std, epochs=100, lr=5e-5):
-    optimizer = Adam(score_net.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    device = next(score_net.parameters()).device
-    score_net.train()
-    history = []
+def train_eurosat():
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    data_path = "/kaggle/input/datasets/tiborcornelli/eurosat/Data/"
     
-    for epoch in range(epochs):
-        epoch_loss = 0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        for batch in pbar:
-            x_raw = batch[0].to(device)
-            x_0 = normalize_eurosat(x_raw, mean, std)
-            t = torch.rand((x_0.shape[0],), device=device)
-            
-            optimizer.zero_grad()
-            loss = denoising_score_loss(score_net, x_0, t)
-            loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(score_net.parameters(), 1.0)
-            
-            optimizer.step()
-            epoch_loss += loss.item()
-            pbar.set_postfix({"loss": loss.item(), "lr": optimizer.param_groups[0]['lr']})
-            
-        scheduler.step()
-        history.append(epoch_loss / len(dataloader))
-    return history
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
-    data_path = "./Data"
-    
-    temp_loader = get_eurosat_loader(data_path, batch_size=32)
-    
-    sum_ = torch.zeros(3)
-    sum_sq = torch.zeros(3)
-    count = 0
-    for data, _ in temp_loader:
-        sum_ += torch.mean(data, dim=[0, 2, 3]) * data.size(0)
-        sum_sq += torch.mean(data**2, dim=[0, 2, 3]) * data.size(0)
-        count += data.size(0)
-    
-    mean = (sum_ / count).tolist()
-    std = torch.sqrt((sum_sq / count) - (sum_ / count)**2).tolist()
-    
+    loader = get_eurosat_loader(data_path)
     model = ScoreNet().to(device)
     
-    losses = run_training(
-        score_net=model,
-        dataloader=temp_loader,
-        mean=mean,
-        std=std,
-        epochs=100,
-        lr=1e-4
-    )
-
-    torch.save(model.state_dict(), "score_net_eurosat.pth")
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(losses)
-    plt.title("Training Loss History")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.savefig('loss_history.png')
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     
-    raw_samples = sample_ula(model, (16, 3, 64, 64), steps=1000, h=0.01)
-    samples = denormalize_eurosat(raw_samples, mean, std)
+    ema = EMA(model.module if isinstance(model, nn.DataParallel) else model)
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    diffusion = Diffusion(device=device)
     
-    grid = utils.make_grid(samples, nrow=4)
-    plt.figure(figsize=(8, 8))
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
-    plt.title("Generated Highway Samples")
-    plt.axis("off")
-    plt.savefig('examples.png')
+    epochs = 100
+    for epoch in range(epochs):
+        pbar = tqdm(loader)
+        pbar.set_description(f"Epoch {epoch+1}/{epochs}")
+        for images, _ in pbar:
+            images = images.to(device)
+            t = torch.randint(0, 1000, (images.shape[0],)).to(device)
+            x_t, noise = diffusion.noise_image(images, t)
+            
+            predicted_noise = model(x_t, t)
+            loss = nn.functional.mse_loss(noise, predicted_noise)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            ema.update()
+            pbar.set_postfix(MSE=loss.item())
+
+        if (epoch + 1) % 10 == 0:
+            ema.apply_shadow()
+            curr_model = model.module if isinstance(model, nn.DataParallel) else model
+            samples = diffusion.sample(curr_model, 16)
+            samples = (samples.clamp(-1, 1) + 1) / 2
+            utils.save_image(samples, f"eurosat_samples_epoch_{epoch+1}.png", nrow=4)
+            ema.restore()
+
+    ema.apply_shadow()
+    final_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save(final_state, "eurosat_diffusion_model.pth")
+
+if __name__ == "__main__":
+    train_eurosat()
