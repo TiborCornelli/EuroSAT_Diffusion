@@ -16,10 +16,6 @@ This was a smaller U-Net architecture with **2,615,939 parameters**.
 * **Results:** The model successfully captures the green, forest-like textures of the landscape.
 * **Limitations:** It fails to render sharp, high-frequency details. Fine structures like highways are missing entirely, appearing as blurred or merged textures.
 
-![U-Net Results](Results/Highway_v1/examples.png)
-
----
-
 ### Model 2: Residual & Attention Upgrade
 For the second iteration, I increased the capacity to **5,069,891 parameters** and introduced several structural changes to improve image quality.
 
@@ -30,7 +26,12 @@ I used these specific techniques to improve the output:
 
 **Current Status:** While this larger model generates a much wider variety of landscape types compared to the first version, it still struggles to generate clear, distinct highways.
 
-![v2 Results](Results/Highway_v2/eurosat_samples_epoch_100.png)
+### Visual Comparison (v1 vs v2)
+
+<p float="left">
+  <img src="Results/Highway_v1/examples.png" width="300" />
+  <img src="Results/Highway_v2/eurosat_samples_epoch_100.png" width="300" />
+</p>
 
 ---
 
